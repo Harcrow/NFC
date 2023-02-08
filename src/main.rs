@@ -9,13 +9,15 @@ use cortex_m_rt::entry;
 use embedded_hal::spi::{Mode, Phase, Polarity};
 use core::cell::{Cell, RefCell};
 use cortex_m::interrupt::Mutex;
-use stm32f4xx_hal::{
-    pac::{self, interrupt},
-    gpio::*
-    prelude::*,
-    spi::*,
-};
+
 use cortex_m_semihosting::hprintln;
+
+use stm32f4xx_hal::{
+                    pac::{self, interrupt},
+                    gpio::*,
+                    prelude::*,
+                    spi::*,
+                };
 
 const ARRAY_SIZE: usize = 5;
 const TX_ARRAY: usize = 2;
@@ -41,21 +43,26 @@ const BIT_RATE: u8 = 0b00000000;
 const ANA_PRESET_CMD: u8 = 0xCC;
 
 const OPERATION_CONTROL_ADD: u8 = 0x02;
-const OPERATION_CONTROL: u8 = 0b11001100;;
+const OPERATION_CONTROL: u8 = 0b11001100;
 
 const MAIN_IRQ_ADD: u8 = 0x17;
 
 //need to set pA0 as an interupt
+//stm32f4xx_hal::gpio::gpioa::PA0
+type IrqMcu = PA0<Input>; 
 
-type IRQ_MCU = gpio::PA0<Input>; 
+//PICK UP FROM HERE ********************
+type SPIHandle = Spi1<(PA5<AF5>,PA6<AF5>,PA7<AF5>)>;
 
-type Spi = Transfer<
-    Stream4<pac::DMA1>,
-    0,
-    Tx<pac::SPI2>,
-    MemoryToPeripheral,
-    &'static mut [u8; ARRAY_SIZE],
->;
+/*pub type I2c1Handle = I2CMasterDma<
+    I2C1,                                       // Instance of I2C
+    (PB8<AF4<OpenDrain>>, PB9<AF4<OpenDrain>>), // Pins
+    Stream1<DMA1>,                              // Stream used for Tx
+    0,                                          // Channel for Tx
+    Stream0<DMA1>,                              // Stream used for Rx (Not used in example)
+    1,                                          // Channel for Rx (Not used in example)
+>; */
+
 //sets up a global variable wrapped in a safe abstraction
 
 //  A mutual exclusion primitive useful for protecting shared data
@@ -64,12 +71,13 @@ type Spi = Transfer<
 //  represents the data that it is protecting. The data can only be accessed through the RAII 
 //  guards returned from lock and try_lock,
 //  which guarantees that the data is only ever accessed when the mutex is locked.
-static G_IRQ: Mutex<RefCell<Option<IRQ_MCU>>> = Mutex::new(RefCell::new(None));
-static G_SPI: Mutex<RefCell<Option<IRQ_MCU>>> = Mutex::new(RefCell::new(None));
+static G_IRQ: Mutex<RefCell<Option<IrqMcu>>> = Mutex::new(RefCell::new(None));
+static G_SPI: Mutex<RefCell<Option<SPIHandle>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
     if let Some(dp) = pac::Peripherals::take() {
+        
         // Set up the system clock.
         let rcc = dp.RCC.constrain();
         let clocks = rcc.cfgr.freeze();
