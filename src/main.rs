@@ -19,7 +19,7 @@ use stm32f4xx_hal::{
 };
 }
 
-const ARRAY_SIZE: usize = 2;
+const ARRAY_SIZE: usize = 10;
 
 //need to set pA0 as an interupt
 //stm32f4xx_hal::gpio::gpioa::PA0
@@ -30,8 +30,7 @@ const ARRAY_SIZE: usize = 2;
 struct Shared {
     led1 :gpio::PA5<Output<PushPull>>,
     SPIHandle :spi::SPI1<(PA5<AF5>,PA6<AF5>,PA7<AF5>)>,
-    ARRAY_SIZE : usize,
-}
+    buffer :[u8; ARRAY_SIZE]],
 
 //nfc_irq: PA0<Input>;
 #[local]
@@ -118,43 +117,19 @@ fn idle(_: idle::Context) -> ! {
     }
 }
 
-#[task(binds = EXTI0, local = [???], shared = [???] )]
-fn rfid_read(mut ctx: irq::Context){
-    ctx.local.mcu_irq.clear_interrupt_pending_bit();
-
 }  
-type MyMono = Systick<1000>; // 1000 Hz / 1 ms granularity
 
-fn main() -> ! {
-    if let Some(dp) = pac::Peripherals::take() {
-        
-        // Set up the system clock.
-        
-        /*sets up pa0 as interuppt for mcu_irq */
-        
-        tx_buffer[0] = 0x40 | 0x3F;
-        tx_buffer[1] = 0x00;
-        //hprintln!("{:#x?}", buffer[0]);
-        cs.set_low();
-        delay(1000);
+#[task(binds = EXTI0, local = [nfc_irq]. shared = [led1, SPIHandle, buffer]]
+fn tag_scan(mut ctx: tag_scan::Context ) {
+   
 
-        let result = spi.transfer(tx_buffer);
-          
-        delay(1000);
-        cs.set_high();
-        hprintln!("{:#x?}", result);
-    }
-        loop {
-            cortex_m::asm::nop();
-        }
-    }
+   let mut led = *ctx.shared.nfc_irq;
+   let mut spi = *ctx.shared.SPIHandle;
 
-#[interrupt]
-fn EXTI0() {
-    cortex_m::interrupt::free(|cs| {
-        let refcell = G_IRQ.borrow(cs).borrow();
-        let exti = match refcell.as_ref() { None => return, Some(v) => v };
-        exti.pr1.modify(|_, w| w.pr0().set_bit());
+
+   ctx.local.nfc_irq.clear_interrupt_pending_bit();
+
+   
     });
     let irq_buffer = cortex_m::singleton!(: [u8; 1] = [1; 1]).unwrap();
     irq_buffer[0] =READ | MAIN_IRQ_ADD;
