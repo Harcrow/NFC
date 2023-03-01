@@ -1,141 +1,187 @@
 #![no_main]
 #![no_std]
-#![deny(unsafe_code)]
+
 #![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(non_camel_case_types)]
 
-use panic_rtt_target as _panic_handler;
+use panic_halt as _;
 
-#[rtic::app(device = stm32f4xx_hal::pac, peripherals = true,)]
-mod app {
-use rtt_target::{rprintln, rtt_init_print};
-use systick_monotonic::*;
+
 use embedded_hal::spi::{Mode, Phase, Polarity};
+use cortex_m_semihosting::hprintln;
+use cortex_m_rt::entry;
+use core::{cell::{Cell, RefCell},
+        fmt::Write,
+    };
+use cortex_m::{
+    asm::delay,
+    interrupt::Mutex,
+    };
 use stm32f4xx_hal::{
-    dma::{config, traits::StreamISR, MemoryToPeripheral, Stream2, StreamsTuple, Transfer},
     pac::*,
+    gpio::*,
     prelude::*,
     spi::*,
-    gpio::*,
-};
-}
+    serial::*,
+    };
 
-const ARRAY_SIZE: usize = 10;
+
+const ARRAY_SIZE: usize = 2;
+
+const TX_ARRAY: usize = 2;
+
+const READ: u8 = 0 << 7 | 1 << 6;
+const WRITE: u8 = 0 << 7 | 0 << 6;
+
+const COMMAND: u8 = 1 << 7 | 1 << 6;
+
+//FIFO
+const FIFO_LOAD: u8 = 0x80;
+const FIFO_READ: u8 = 0xBF;
+
+//table 22 and 23 -- sets as initiator, ISO1443A and collision avoidance
+const MODE_ADD: u8 = 0x03;
+const MODE: u8 = 0b00001001;
+
+
+//sets to tx/rx ~106kb/s -- this is the slowest
+const BIT_RATE_ADD: u8 = 0x04;
+const BIT_RATE: u8 = 0b00000000; 
+
+const ANA_PRESET_CMD: u8 = 0xCC;
+
+const OPERATION_CONTROL_ADD: u8 = 0x02;
+const OPERATION_CONTROL: u8 = 0b11001100;
+
+const MAIN_IRQ_ADD: u8 = 0x17;
 
 //need to set pA0 as an interupt
-//stm32f4xx_hal::gpio::gpioa::PA0
+
+type IRQ_MCU = PA0<Input>; 
+
+type SPIHandle = Spi1<(PA5<AF5>,PA6<AF5>,PA7<AF5>)>;    
 
 
-//type SPIHandle = Spi1<(PA5<AF5>,PA6<AF5>,PA7<AF5>)>;
-#[shared]
-struct Shared {
-    led1 :gpio::PA5<Output<PushPull>>,
-    SPIHandle :spi::SPI1<(PA5<AF5>,PA6<AF5>,PA7<AF5>)>,
-    buffer :[u8; ARRAY_SIZE]],
 
-//nfc_irq: PA0<Input>;
-#[local]
-struct Local {
-    nfc_irq :gpio::PA0<Input>
-}
+//sets up a global variable wrapped in a safe abstraction
 
-#[monotonic(binds = SysTick, default = true)]
+//  A mutual exclusion primitive useful for protecting shared data
+//  This mutex will block threads waiting for the lock to become available.
+//  The mutex can be created via a new constructor. Each mutex has a type parameter which 
+//  represents the data that it is protecting. The data can only be accessed through the RAII 
+//  guards returned from lock and try_lock,
+//  which guarantees that the data is only ever accessed when the mutex is locked.
+static G_IRQ: Mutex<RefCell<Option<IRQ_MCU>>> = Mutex::new(RefCell::new(None));
+static G_SPI: Mutex<RefCell<Option<SPIHandle>>> = Mutex::new(RefCell::new(None));
 
-#[init]
-fn init(ctx: init ::Context) -> (Shared, Local, init::Monotonics){
+#[entry]
+fn main() -> ! {
+    if let Some(mut dp) = Peripherals::take() {
+        // Set up the system clock.
 
-    let mut dp = ctx.device;
-    let rcc = dp.RCC.constrain();
-    /* let clocks = rcc
-            .cfgr
-            .use_hse(8.mhz())
-            .sysclk(72.mhz())
-            .pclk1(36.mhz())
-            .freeze(&mut flash.acr);*/
-    let clocks = rcc.cfgr.freeze();
+       
+        let rcc = dp.RCC.constrain();
+        let clocks = rcc.cfgr.freeze();
 
+        let gpioa = dp.GPIOA.split();
+        let gpiob = dp.GPIOB.split();
+        let mut cs = gpiob.pb6.into_push_pull_output();
+        cs.set_high();
+
+
+        //clk, miso, mosi, respectively
+        let pa5 = gpioa.pa5.into_alternate().internal_pull_up(true);
+        let pa6 = gpioa.pa6.into_alternate();
+        let pa7 = gpioa.pa7.into_alternate();
+        let mode = Mode {
+
+            polarity: Polarity::IdleLow,
+            phase: Phase::CaptureOnSecondTransition,
+        
+        };
     
-    // 1) Promote the GPIOA and GPIOB PAC struct
-    let gpioa = dp.GPIOA.split();
-    let gpiob = dp.GPIOB.split();
 
-    //clk, miso, mosi, respectively
-    let pa5 = gpioa.pa5.into_alternate().internal_pull_up(true);
-    let pa6 = gpioa.pa6.into_alternate();
-    let pa7 = gpioa.pa7.into_alternate();
+        let mut spi = Spi::new(
+                                dp.SPI1,
+                                (pa5, pa6, pa7),
+                                mode,
+                                1.MHz(),
+                                &clocks
+                            );
 
-    let mut spi = Spi::new(dp.SPI1,
-        (pa5, pa6, pa7),
-         mode,
-         1.MHz(),
-         &clocks);
 
-    // 2) Configure Pin and Obtain Handle
-    let mut led = gpioa.pa5.into_push_pull_output();
-    let mut cs = gpiob.pb6.into_push_pull_output();
-    
-    let nfc_irq = gpioa.pa0;
-    let mut syscfg = dp.SYSCFG.constrain();
-    
-    nfc_irq.make_interrupt_source(&mut syscfg)
-    nfc_irq.trigger_on_edge(&mut dp.EXTI, Edge::Rising)
-    nfc_irq.enable_interrupt(&mut dp.EXTI);
+        /*sets up pa0 as interuppt for mcu_irq */
+        let mut irq = gpioa.pa0;
+        let mut syscfg = dp.SYSCFG.constrain();
+        irq.make_interrupt_source(&mut syscfg);
+        irq.trigger_on_edge(&mut dp.EXTI, Edge::Rising);
+        irq.enable_interrupt(&mut dp.EXTI);
 
-    cs.set_high();
-    
-    let mode = Mode {
+        let uart_tx = gpioa.pa2.into_alternate();
+        
+        //configuring UART 
+        let mut tx = dp.USART2.tx(
+            uart_tx,
+            Config::default()
+                .baudrate(115200.bps())
+                .wordlength_8()
+                .parity_none(),
+            &clocks,
+        )
+        .unwrap();
 
-        polarity: Polarity::IdleLow,
-        phase: Phase::CaptureOnSecondTransition,
-    
-    };
-    rtt_init_print!();
-    rprintln!("hello, world!");
+        // Enable the external interrupt in the NVIC by passing the NFC IRQ interrupt number
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(irq.interrupt());
+        }
 
-    
-    // lastly return the shared and local resources, as per RTIC's spec.
-    (
-        // Initialization of shared resources
-        Shared { 
-            led1,
-            SPIHandle,
-            ARRAY_SIZE,
-        },
-        // Initialization of task local resources
-        Local {
-            nfc_irq,
-        },
-        // Move the monotonic timer to the RTIC run-time, this enables
-        // scheduling
-        init::Monotonics(),
-    )
-}
+        // Now that NFC IRQ is configured, move button into global context
+        cortex_m::interrupt::free(|cs| {
+            G_IRQ.borrow(cs).replace(Some(irq));
+           // G_SPI.borrow(cs).replace(Some(spi));
+        });
 
-fn idle(_: idle::Context) -> ! {
-    loop {
-        // Go to sleep
-        cortex_m::asm::wfi();
+        let tx_buffer = cortex_m::singleton!(: [u8; ARRAY_SIZE] = [1; ARRAY_SIZE]).unwrap();
+        
+        /*
+        Attempting to read ID register. 0x3F--read mode 'mosi --0b01xxxxxx'
+        Should report 0x0D
+         */
+        tx_buffer[0] = 0x40 | 0x3F;
+        tx_buffer[1] = 0x00;
+        //hprintln!("{:#x?}", buffer[0]);
+        cs.set_low();
+        delay(100);
+
+        let result = spi.transfer(tx_buffer).unwrap();
+          
+        delay(1000);
+        cs.set_high();
+        //hprintln!("printing NFC ID");
+        //hprintln!("{:#x?}", result);
+        writeln!(tx, "Device ID {:#x?}\r", result).unwrap();
+        
+        cortex_m::interrupt::free(|cs| {
+            G_SPI.borrow(cs).replace(Some(spi));
+           // G_SPI.borrow(cs).replace(Some(spi));
+        });
+
     }
-}
+        loop {
+            //rprintln!("hello, world!");
+        }
+    }
 
-}  
-
-#[task(binds = EXTI0, local = [nfc_irq]. shared = [led1, SPIHandle, buffer]]
-fn tag_scan(mut ctx: tag_scan::Context ) {
-   
-
-   let mut led = *ctx.shared.nfc_irq;
-   let mut spi = *ctx.shared.SPIHandle;
-
-
-   ctx.local.nfc_irq.clear_interrupt_pending_bit();
-
-   
+/*#[interrupt]
+fn EXTI0() {
+    cortex_m::interrupt::free(|cs| {
+        let refcell = G_IRQ.borrow(cs).borrow();
+        let exti = match refcell.as_ref() { None => return, Some(v) => v };
+        exti.pr1.modify(|_, w| w.pr0().set_bit());
     });
     let irq_buffer = cortex_m::singleton!(: [u8; 1] = [1; 1]).unwrap();
     irq_buffer[0] =READ | MAIN_IRQ_ADD;
-    let result = spi.transfer(irq_buffer);
-
-
-
-
+    //let result = spi.transfer(irq_buffer);
 }
+*/
