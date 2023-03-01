@@ -1,0 +1,7 @@
+#ignore target builds directory
+target/
+
+#ignore cargo.lock
+Cargo.lock
+Embed.toml
+
